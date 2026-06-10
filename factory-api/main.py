@@ -94,6 +94,40 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         os.unlink(tmp_path)
 
 
+EDITOR_PROMPT = """You are a professional editor reviewing a newsletter draft. Fix the following issues — nothing else:
+
+1. Pronoun consistency: the reader is always "you/your". Never "they/them/their" when referring to the reader. Fix every instance.
+2. Grammar and spelling errors.
+3. Remove filler phrases: "I mean", "right?", "you know", "sort of", "kind of", "basically", "I'm not saying X, I'm saying Y" constructions.
+4. Break up any sequence of 3+ long sentences (20+ words each) — insert a short punchy sentence.
+5. Remove any sentence that sounds like AI or a life coach: "we've all been there", "you're not alone", "it's worth it", "believe in yourself".
+6. Preserve all HTML <p> tags exactly. Do not add or remove any tags.
+7. Do not change the meaning, stories, structure, or CTA stack. Only fix the issues above.
+
+Return the corrected body_html only — no JSON wrapper, no explanation, just the HTML."""
+
+
+def editor_pass(draft: dict) -> dict:
+    client = get_groq()
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": EDITOR_PROMPT},
+            {"role": "user", "content": draft["body_html"]},
+        ],
+        temperature=0.2,
+        max_tokens=4096,
+    )
+    corrected_html = response.choices[0].message.content.strip()
+    # Strip any accidental markdown fences
+    if corrected_html.startswith("```"):
+        corrected_html = corrected_html.split("```")[1]
+        if corrected_html.startswith("html"):
+            corrected_html = corrected_html[4:]
+        corrected_html = corrected_html.strip()
+    return {**draft, "body_html": corrected_html}
+
+
 def generate_from_transcript(transcript: str, feedback: str = "") -> dict:
     style_guide = STYLE_GUIDE.read_text()
     feedback_section = f"\n\n## Feedback to incorporate\n{feedback}" if feedback else ""
@@ -112,7 +146,8 @@ def generate_from_transcript(transcript: str, feedback: str = "") -> dict:
         temperature=0.7,
         max_tokens=4096,
     )
-    return parse_draft(response.choices[0].message.content)
+    draft = parse_draft(response.choices[0].message.content)
+    return editor_pass(draft)
 
 
 def tg_send(chat_id: int, text: str, parse_mode: str = "HTML") -> None:
