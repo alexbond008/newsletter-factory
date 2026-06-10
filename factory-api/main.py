@@ -96,13 +96,12 @@ def transcribe_audio(audio_bytes: bytes) -> str:
 
 EDITOR_PROMPT = """You are a professional editor reviewing a newsletter draft. Fix the following issues — nothing else:
 
-1. Pronoun consistency: the reader is always "you/your". Never "they/them/their" when referring to the reader. Fix every instance.
-2. Grammar and spelling errors.
-3. Remove filler phrases: "I mean", "right?", "you know", "sort of", "kind of", "basically", "I'm not saying X, I'm saying Y" constructions.
-4. Break up any sequence of 3+ long sentences (20+ words each) — insert a short punchy sentence.
-5. Remove any sentence that sounds like AI or a life coach: "we've all been there", "you're not alone", "it's worth it", "believe in yourself".
-6. Preserve all HTML <p> tags exactly. Do not add or remove any tags.
-7. Do not change the meaning, stories, structure, or CTA stack. Only fix the issues above.
+1. Grammar and spelling errors.
+2. Remove filler phrases: "I mean", "right?", "you know", "sort of", "kind of", "basically", "I'm not saying X, I'm saying Y" constructions unless they add true value to the message.
+3. Break up any sequence of 3+ long sentences (20+ words each) — insert a short punchy sentence.
+4. Remove any sentence that sounds like AI or a life coach: "we've all been there", "you're not alone", "it's worth it", "believe in yourself".
+5. Preserve all HTML <p> tags exactly. Do not add or remove any tags.
+6. Do not change the meaning, stories, structure, or CTA stack. Only fix the issues above.
 
 Return the corrected body_html only — no JSON wrapper, no explanation, just the HTML."""
 
