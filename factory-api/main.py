@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,6 +29,31 @@ app.add_middleware(
 STATIC_DIR = Path(__file__).parent / "static"
 STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+def _pick_upload_dir() -> Path:
+    """Where user-uploaded images live. Prefer the persistent Railway volume at
+    /data (survives restarts/redeploys); fall back to a local dir (ephemeral —
+    fine for testing, but images may break after a redeploy until the volume
+    exists). Returns the first writable option."""
+    candidates = [Path("/data") / "uploads", STATIC_DIR / "uploads"]
+    for d in candidates:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            probe = d / ".write_test"
+            probe.write_text("ok")
+            probe.unlink()
+            logger.info(f"upload dir = {d} ({'persistent volume' if str(d).startswith('/data') else 'EPHEMERAL local'})")
+            return d
+        except Exception:
+            continue
+    fallback = Path(tempfile.gettempdir()) / "uploads"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+UPLOAD_DIR = _pick_upload_dir()
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # Public base URL of this service — used to build absolute <img> URLs that Kit
 # (and email clients) can fetch. Override via env if the Railway domain changes.
@@ -165,6 +191,66 @@ def generate_from_transcript(transcript: str, feedback: str = "") -> dict:
     return editor_pass(draft)
 
 
+IMG_PLACE_PROMPT = """You decide where to place ONE image inside a newsletter draft.
+
+You get the draft's paragraphs (numbered) and a short caption describing the image.
+Pick the single best spot so the image sits right next to the text it relates to.
+
+Reply with ONLY a number — nothing else:
+- 0  => place the image at the very top, before paragraph 1
+- N  => place the image immediately AFTER paragraph N
+"""
+
+
+def image_block(url: str, caption: str) -> str:
+    alt = (caption or "image").replace('"', "'")
+    return (
+        f'<p style="text-align:center;">'
+        f'<img src="{url}" alt="{alt}" style="max-width:100%;height:auto;" />'
+        f"</p>"
+    )
+
+
+def choose_image_position(paragraphs: list[str], caption: str) -> int:
+    """Ask the model which paragraph the image belongs after. Returns 0..len(paragraphs)
+    (0 = top, N = after paragraph N). Falls back to end on any parsing trouble."""
+    numbered = "\n".join(
+        f"{i + 1}. {re.sub(r'<[^>]+>', '', p).strip()}" for i, p in enumerate(paragraphs)
+    )
+    user = f"Caption: {caption or '(no caption given)'}\n\nParagraphs:\n{numbered}"
+    try:
+        client = get_groq()
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": IMG_PLACE_PROMPT},
+                {"role": "user", "content": user},
+            ],
+            temperature=0,
+            max_tokens=8,
+        )
+        m = re.search(r"\d+", resp.choices[0].message.content or "")
+        n = int(m.group()) if m else len(paragraphs)
+    except Exception:
+        logger.exception("image position selection failed; appending at end")
+        n = len(paragraphs)
+    return max(0, min(n, len(paragraphs)))
+
+
+def insert_image_into_draft(body_html: str, url: str, caption: str) -> str:
+    """Insert an image block at the most contextually relevant spot in the body."""
+    paragraphs = re.findall(r"<p\b[^>]*>.*?</p>", body_html, flags=re.DOTALL | re.IGNORECASE)
+    block = image_block(url, caption)
+    if not paragraphs:
+        return block + body_html
+    pos = choose_image_position(paragraphs, caption)
+    if pos == 0:
+        return block + body_html
+    anchor = paragraphs[pos - 1]
+    idx = body_html.find(anchor) + len(anchor)
+    return body_html[:idx] + block + body_html[idx:]
+
+
 # Aleks always ends every newsletter with two Kit "reusable snippets":
 #   1. "pic + Channel" — his profile photo linking to his YouTube channel
 #   2. "P.S. Coaching" — a P.S. offering 1:1 coaching with a Calendly link
@@ -293,10 +379,12 @@ def tg_get_file_url(file_id: str) -> str:
 
 def format_draft_message(draft: dict) -> str:
     subjects = "\n".join(f"{i+1}. {s}" for i, s in enumerate(draft["subject_lines"]))
-    # Preserve paragraph breaks before stripping tags
     body = draft["body_html"]
-    body = re.sub(r"</p>\s*<p>", "\n\n", body)
-    body = re.sub(r"<p>|</p>", "", body)
+    # Show image placeholders so the user can see where images landed
+    body = re.sub(r'<img[^>]*alt="([^"]*)"[^>]*>', r"🖼 [image: \1]", body, flags=re.IGNORECASE)
+    body = re.sub(r"<img[^>]*>", "🖼 [image]", body, flags=re.IGNORECASE)
+    # Preserve paragraph breaks (handles <p> with attributes) before stripping tags
+    body = re.sub(r"</p>\s*<p\b[^>]*>", "\n\n", body, flags=re.IGNORECASE)
     body = re.sub(r"<[^>]+>", "", body).strip()
     max_body = 3000
     if len(body) > max_body:
@@ -306,8 +394,8 @@ def format_draft_message(draft: dict) -> str:
         f"<b>Preview text:</b>\n{draft['preview_text']}\n\n"
         f"<b>Draft:</b>\n\n{body}\n\n"
         f"───────────────\n"
-        f"Reply with feedback to regenerate, /send_draft to preview it in your inbox, "
-        f"or /push to create a Kit.com draft."
+        f"Reply with feedback to regenerate, send a photo (with a caption) to add an image, "
+        f"/send_draft to preview it in your inbox, or /push to create a Kit.com draft."
     )
 
 
@@ -319,13 +407,16 @@ async def handle_telegram_update(update: dict) -> None:
 
     text = message.get("text", "")
     voice = message.get("voice") or message.get("audio")
+    photo = message.get("photo")
 
-    logger.info(f"update chat_id={chat_id} text={text!r} voice={bool(voice)}")
+    logger.info(f"update chat_id={chat_id} text={text!r} voice={bool(voice)} photo={bool(photo)}")
 
     if text == "/start":
         tg_send(chat_id, (
             "Welcome to Newsletter Factory!\n\n"
-            "Send me a voice message and I'll turn it into a newsletter draft in your style.\n\n"
+            "Send me a voice message and I'll turn it into a newsletter draft in your style.\n"
+            "Reply with text to refine it. Send a photo (with a caption describing it) "
+            "and I'll drop it into the draft at the most relevant spot.\n\n"
             "Commands:\n"
             "/send_draft — email yourself a preview of the current draft\n"
             "/push — create a draft in Kit.com\n"
@@ -383,6 +474,30 @@ async def handle_telegram_update(update: dict) -> None:
             tg_send(chat_id, "Preview scheduled to send now. It should land in your inbox within a minute or two.")
         else:
             tg_send(chat_id, "Kit.com error sending the preview. Check the logs.")
+        return
+
+    if photo:
+        session = _sessions.get(chat_id)
+        if not session or "draft" not in session:
+            tg_send(chat_id, "Send a voice note first to create a draft, then send a photo (with a caption describing it) to add it.")
+            return
+        caption = message.get("caption", "")
+        tg_send(chat_id, "Adding your image to the draft...")
+        try:
+            file_id = photo[-1]["file_id"]  # last entry is the largest size
+            file_url = tg_get_file_url(file_id)
+            img_bytes = httpx.get(file_url, timeout=60).content
+            fname = f"{uuid.uuid4().hex}.jpg"
+            (UPLOAD_DIR / fname).write_bytes(img_bytes)
+            public_url = f"{PUBLIC_BASE_URL}/uploads/{fname}"
+            logger.info(f"saved image {fname} ({len(img_bytes)} bytes) caption={caption!r}")
+            draft = session["draft"]
+            draft["body_html"] = insert_image_into_draft(draft["body_html"], public_url, caption)
+            _sessions[chat_id]["draft"] = draft
+            tg_send(chat_id, format_draft_message(draft))
+        except Exception as e:
+            logger.exception("Error adding image")
+            tg_send(chat_id, f"Couldn't add the image: {str(e)[:300]}")
         return
 
     if voice:
