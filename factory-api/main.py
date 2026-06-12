@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -58,6 +59,10 @@ Return valid JSON only (no markdown fences, no extra text):
 
 # In-memory store: chat_id -> {"draft": ..., "transcript": ...}
 _sessions: dict[int, dict] = {}
+
+# Safety cap: /send_draft refuses to send if the preview tag has more subscribers
+# than this, so a misconfigured tag can never blast the whole list.
+PREVIEW_TAG_MAX_SUBSCRIBERS = 3
 
 
 def get_groq() -> Groq:
@@ -149,6 +154,81 @@ def generate_from_transcript(transcript: str, feedback: str = "") -> dict:
     return editor_pass(draft)
 
 
+def create_kit_broadcast(kit_key: str, draft: dict) -> int | None:
+    """Create a draft broadcast in Kit.com (v4). Returns the broadcast id, or None on error.
+
+    Kit v4 expects the broadcast fields at the TOP LEVEL of the JSON body — NOT
+    nested under a "broadcast" key. Nesting them makes Kit ignore every field and
+    silently create a blank broadcast (which then 404s in the web editor).
+    """
+    subject = draft["subject_lines"][0]
+    r = httpx.post(
+        "https://api.kit.com/v4/broadcasts",
+        headers={"X-Kit-Api-Key": kit_key, "Content-Type": "application/json"},
+        json={
+            "subject": subject,
+            "description": subject,  # internal name shown in the Kit broadcast list
+            "preview_text": draft["preview_text"],
+            "content": draft["body_html"],
+            "public": False,         # keep it a private draft, don't publish to the web feed
+            "send_at": None,         # null => save as draft (do not schedule/send)
+        },
+        timeout=30,
+    )
+    logger.info(f"kit create status={r.status_code} body={r.text[:300]}")
+    if r.status_code in (200, 201):
+        return r.json().get("broadcast", {}).get("id")
+    return None
+
+
+def find_kit_tag(kit_key: str, name: str) -> dict | None:
+    """Look up a Kit tag by (case-insensitive) name. Returns the tag dict or None."""
+    r = httpx.get(
+        "https://api.kit.com/v4/tags",
+        headers={"X-Kit-Api-Key": kit_key},
+        params={"per_page": 1000},
+        timeout=30,
+    )
+    logger.info(f"kit list tags status={r.status_code}")
+    if r.status_code != 200:
+        return None
+    for tag in r.json().get("tags", []):
+        if tag.get("name", "").strip().lower() == name.strip().lower():
+            return tag
+    return None
+
+
+def send_kit_preview(kit_key: str, draft: dict, tag_id: int) -> int | None:
+    """Send the draft as a real broadcast to ONLY the given tag (a one-person preview
+    audience), scheduled for now. Returns the broadcast id, or None on error.
+
+    Same top-level-fields rule as create_kit_broadcast. The subscriber_filter restricts
+    the audience to the tag; send_at set to now triggers the actual send.
+    """
+    subject = draft["subject_lines"][0]
+    now_iso = datetime.now(timezone.utc).isoformat()
+    r = httpx.post(
+        "https://api.kit.com/v4/broadcasts",
+        headers={"X-Kit-Api-Key": kit_key, "Content-Type": "application/json"},
+        json={
+            "subject": f"[PREVIEW] {subject}",
+            "description": f"[PREVIEW] {subject}",
+            "preview_text": draft["preview_text"],
+            "content": draft["body_html"],
+            "public": False,
+            "send_at": now_iso,
+            "subscriber_filter": [
+                {"all": [{"type": "tag", "ids": [tag_id]}], "any": None, "none": None}
+            ],
+        },
+        timeout=30,
+    )
+    logger.info(f"kit preview send status={r.status_code} body={r.text[:300]}")
+    if r.status_code in (200, 201):
+        return r.json().get("broadcast", {}).get("id")
+    return None
+
+
 def tg_send(chat_id: int, text: str, parse_mode: str = "HTML") -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     r = httpx.post(
@@ -185,7 +265,8 @@ def format_draft_message(draft: dict) -> str:
         f"<b>Preview text:</b>\n{draft['preview_text']}\n\n"
         f"<b>Draft:</b>\n\n{body}\n\n"
         f"───────────────\n"
-        f"Reply with feedback to regenerate, or /push to create a Kit.com draft."
+        f"Reply with feedback to regenerate, /send_draft to preview it in your inbox, "
+        f"or /push to create a Kit.com draft."
     )
 
 
@@ -205,6 +286,7 @@ async def handle_telegram_update(update: dict) -> None:
             "Welcome to Newsletter Factory!\n\n"
             "Send me a voice message and I'll turn it into a newsletter draft in your style.\n\n"
             "Commands:\n"
+            "/send_draft — email yourself a preview of the current draft\n"
             "/push — create a draft in Kit.com\n"
             "/start — show this message"
         ))
@@ -220,23 +302,46 @@ async def handle_telegram_update(update: dict) -> None:
         if not kit_key:
             tg_send(chat_id, "KIT_API_KEY not configured.")
             return
-        r = httpx.post(
-            "https://api.kit.com/v4/broadcasts",
-            headers={"X-Kit-Api-Key": kit_key, "Content-Type": "application/json"},
-            json={"broadcast": {
-                "subject": draft["subject_lines"][0],
-                "preview_text": draft["preview_text"],
-                "content": draft["body_html"],
-                "send_at": None,
-            }},
-            timeout=30,
-        )
-        logger.info(f"kit status={r.status_code} body={r.text[:200]}")
-        if r.status_code in (200, 201):
-            broadcast_id = r.json().get("broadcast", {}).get("id")
+        broadcast_id = create_kit_broadcast(kit_key, draft)
+        if broadcast_id:
             tg_send(chat_id, f"Draft created in Kit.com!\n\nhttps://app.kit.com/broadcasts/{broadcast_id}/edit")
         else:
-            tg_send(chat_id, f"Kit.com error {r.status_code}: {r.text[:200]}")
+            tg_send(chat_id, "Kit.com error creating the draft. Check the logs.")
+        return
+
+    if text == "/send_draft":
+        session = _sessions.get(chat_id)
+        if not session or "draft" not in session:
+            tg_send(chat_id, "No draft yet. Send a voice message first.")
+            return
+        draft = session["draft"]
+        kit_key = os.environ.get("KIT_API_KEY")
+        if not kit_key:
+            tg_send(chat_id, "KIT_API_KEY not configured.")
+            return
+        tag_name = os.environ.get("KIT_PREVIEW_TAG", "Preview")
+        tag = find_kit_tag(kit_key, tag_name)
+        if not tag:
+            tg_send(chat_id, (
+                f"No Kit tag named \"{tag_name}\" found.\n\n"
+                f"In Kit, create a tag called \"{tag_name}\" and add only your own email to it, "
+                f"then try /send_draft again. (Or set KIT_PREVIEW_TAG to an existing tag name.)"
+            ))
+            return
+        count = tag.get("subscriber_count", 0)
+        if count > PREVIEW_TAG_MAX_SUBSCRIBERS:
+            tg_send(chat_id, (
+                f"Safety stop: the \"{tag_name}\" tag has {count} subscribers. "
+                f"A preview should go to just you. Trim that tag to {PREVIEW_TAG_MAX_SUBSCRIBERS} "
+                f"or fewer before using /send_draft, so this never blasts your whole list."
+            ))
+            return
+        tg_send(chat_id, f"Sending a preview to the \"{tag_name}\" tag ({count} subscriber(s))... check your inbox shortly.")
+        broadcast_id = send_kit_preview(kit_key, draft, tag["id"])
+        if broadcast_id:
+            tg_send(chat_id, "Preview scheduled to send now. It should land in your inbox within a minute or two.")
+        else:
+            tg_send(chat_id, "Kit.com error sending the preview. Check the logs.")
         return
 
     if voice:
