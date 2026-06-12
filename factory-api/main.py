@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from groq import Groq
 from pydantic import BaseModel
 
@@ -23,6 +24,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# Public base URL of this service — used to build absolute <img> URLs that Kit
+# (and email clients) can fetch. Override via env if the Railway domain changes.
+PUBLIC_BASE_URL = os.environ.get(
+    "PUBLIC_BASE_URL", "https://newsletter-api-production-fa3d.up.railway.app"
+).rstrip("/")
 
 STYLE_GUIDE = Path(__file__).parent / "style_guide" / "ALEKS_STYLE.md"
 
@@ -54,7 +65,7 @@ Return valid JSON only (no markdown fences, no extra text):
 
 - subject_lines: exactly 3 options following the formula in the style guide
 - preview_text: 1 sentence shown in email inbox previews
-- body_html: full post body wrapped in <p> tags, 600-900 words, CTA stack at end
+- body_html: full post body wrapped in <p> tags, 600-900 words. Use SHORT paragraphs (1-2 sentences, often a single sentence), each in its own <p>, with lots of breathing room. End with the close paragraph — do NOT add any CTA, sign-off, P.S., or links; the system appends Aleks's footer automatically.
 """
 
 # In-memory store: chat_id -> {"draft": ..., "transcript": ...}
@@ -106,7 +117,7 @@ EDITOR_PROMPT = """You are a professional editor reviewing a newsletter draft. F
 3. Break up any sequence of 3+ long sentences (20+ words each) — insert a short punchy sentence.
 4. Remove any sentence that sounds like AI or a life coach: "we've all been there", "you're not alone", "it's worth it", "believe in yourself".
 5. Preserve all HTML <p> tags exactly. Do not add or remove any tags.
-6. Do not change the meaning, stories, structure, or CTA stack. Only fix the issues above.
+6. Do not change the meaning, stories, structure, or sign-off. Only fix the issues above.
 
 Return the corrected body_html only — no JSON wrapper, no explanation, just the HTML."""
 
@@ -154,6 +165,36 @@ def generate_from_transcript(transcript: str, feedback: str = "") -> dict:
     return editor_pass(draft)
 
 
+# Aleks always ends every newsletter with two Kit "reusable snippets":
+#   1. "pic + Channel" — his profile photo linking to his YouTube channel
+#   2. "P.S. Coaching" — a P.S. offering 1:1 coaching with a Calendly link
+# Kit snippets can't be referenced via the API, so we bake their exact content
+# in here as static HTML and auto-append it to every draft. The channel image is
+# served by this app from /static/channel.png.
+YOUTUBE_URL = os.environ.get("YOUTUBE_URL", "https://www.youtube.com/@aleksgornik")
+COACHING_CALENDLY_URL = "https://calendly.com/aleksgornikmedia/strategy-call-with-aleks"
+
+
+def signature_footer() -> str:
+    return (
+        f'<p style="text-align:center;">'
+        f'<a href="{YOUTUBE_URL}">'
+        f'<img src="{PUBLIC_BASE_URL}/static/channel.png" alt="My YouTube channel: @aleksgornik" '
+        f'style="max-width:100%;width:520px;height:auto;" />'
+        f"</a></p>"
+        f"<p>P.S.</p>"
+        f"<p>I'm planning to run 1-on-1 coaching with a select few students to help you "
+        f"navigate university and land those internship / grad roles.</p>"
+        f'<p>If you’re interested, book a call with me here at '
+        f'<a href="{COACHING_CALENDLY_URL}">{COACHING_CALENDLY_URL}</a>.</p>'
+    )
+
+
+def build_email_html(draft: dict) -> str:
+    """Assemble the full email body: the generated post + the standing signature footer."""
+    return draft["body_html"].rstrip() + signature_footer()
+
+
 def create_kit_broadcast(kit_key: str, draft: dict) -> int | None:
     """Create a draft broadcast in Kit.com (v4). Returns the broadcast id, or None on error.
 
@@ -169,7 +210,7 @@ def create_kit_broadcast(kit_key: str, draft: dict) -> int | None:
             "subject": subject,
             "description": subject,  # internal name shown in the Kit broadcast list
             "preview_text": draft["preview_text"],
-            "content": draft["body_html"],
+            "content": build_email_html(draft),
             "public": False,         # keep it a private draft, don't publish to the web feed
             "send_at": None,         # null => save as draft (do not schedule/send)
         },
@@ -214,7 +255,7 @@ def send_kit_preview(kit_key: str, draft: dict, tag_id: int) -> int | None:
             "subject": f"[PREVIEW] {subject}",
             "description": f"[PREVIEW] {subject}",
             "preview_text": draft["preview_text"],
-            "content": draft["body_html"],
+            "content": build_email_html(draft),
             "public": False,
             "send_at": now_iso,
             "subscriber_filter": [
@@ -304,7 +345,7 @@ async def handle_telegram_update(update: dict) -> None:
             return
         broadcast_id = create_kit_broadcast(kit_key, draft)
         if broadcast_id:
-            tg_send(chat_id, f"Draft created in Kit.com!\n\nhttps://app.kit.com/broadcasts/{broadcast_id}/edit")
+            tg_send(chat_id, f"Draft created in Kit.com!\n\nhttps://app.kit.com/campaigns/{broadcast_id}/draft")
         else:
             tg_send(chat_id, "Kit.com error creating the draft. Check the logs.")
         return

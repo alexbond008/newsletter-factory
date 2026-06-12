@@ -75,10 +75,12 @@ Personal reflection on what this meant for Aleks. How it changed the way he oper
 Connect back to the reader — make them feel understood, not lectured.
 End with a challenge or a question they can sit with. No hard sell. No "don't miss out."
 
-### 4. CTA STACK (always last, always in this exact order — no exceptions)
-- Book a 1:1 with Aleks: https://calendly.com/aleksgornik/30min
-- Subscribe to YouTube: @aleksgornik
-- "Hit reply — I read every email."
+### 4. SIGN-OFF — do NOT write one
+End the body with the CLOSE paragraph. Do NOT generate any CTA stack, sign-off,
+P.S., coaching pitch, YouTube link, Calendly link, or "hit reply" line. The system
+automatically appends Aleks's standing footer (his channel image + a P.S. coaching
+block) after your body. Anything you add here will be a duplicate — so stop after
+the close.
 
 ## Subject Line Formula
 Generate exactly 3 subject line options.
@@ -100,11 +102,15 @@ One sentence. Tease the central paradox or confession without giving away the re
 
 ## Length and Format
 - Body: 600–900 words
-- Paragraphs: 2–4 sentences max. Never more.
+- Paragraphs: SHORT. 1–2 sentences each — often a single sentence on its own. Never more than 2.
+- Break often. The post should feel airy and fast to scan on a phone, with lots of
+  white space between thoughts — like the real newsletters at aleks-gornik.kit.com.
+  When in doubt, split a paragraph in two.
+- Each paragraph is its own `<p>` tag. More `<p>` tags = more breathing room. That is the goal.
 - No section headers inside the body — structure is implicit
 - Output format: HTML with `<p>` tags wrapping each paragraph only
 - No `<h1>`, `<h2>`, `<strong>`, `<em>`, or other tags in the body
-- CTA stack uses `<p>` tags like everything else
+- Do NOT add a CTA stack, sign-off, or P.S. — the system appends Aleks's footer automatically (see structure section 4)
 
 ## What the Data Shows Works
 - Identity/self-classification posts: 40–44% open rate vs ~27% average
