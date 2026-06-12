@@ -70,3 +70,15 @@ The generation prompt enforces that all concrete details (names, numbers, storie
 ## Kit.com API
 
 Uses v4: `POST https://api.kit.com/v4/broadcasts` with `X-Kit-Api-Key` header. Setting `send_at: null` creates a draft. Broadcast edit URL: `https://app.kit.com/broadcasts/{id}/edit`.
+
+## Session 2026-06-12
+
+**Status**: Created global `/handoff` skill for Claude Code session handoffs
+
+**Work**: Built a new skill that synthesizes session context into CLAUDE.md. The skill reads the conversation, identifies main work threads, and appends a concise handoff summary (covering what was worked on, key decisions, remaining work, and gotchas). Installed it globally at `~/.claude/skills/handoff/` so it's discoverable across all projects.
+
+**Key decisions**: Made it a global skill (not project-specific) for reusability. Used flexible summary format rather than rigid template — each session adapts the structure to what makes sense for that work. Skill is instruction-based: Claude reads SKILL.md and synthesizes the session, so it's adaptable and doesn't require complex parsing or scripting.
+
+**Remaining**: Optional enhancements could include auto-suggesting the skill when token usage gets high (mentioned in description but not yet implemented), and testing on real-world handoff scenarios to refine the guidance.
+
+**Gotchas**: Skills must be in the correct discovery locations — `~/.claude/skills/` for global, `.claude/skills/` for project-only. Initial packaging attempt via script failed, but moving the directory to the right location and letting Claude Code's native discovery load it worked immediately.
