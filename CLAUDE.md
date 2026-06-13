@@ -70,7 +70,7 @@ The generation prompt enforces that all concrete details (names, numbers, storie
 | `TELEGRAM_BOT_TOKEN` | Bot: `@newsletter_copywriter_bot` |
 | `KIT_API_KEY` | Kit.com API v4 for `/push` and `/send_draft` |
 | `KIT_PREVIEW_TAG` | (optional) Kit tag name `/send_draft` sends previews to. Default `Preview` |
-| `KIT_PREVIEW_EMAIL` | (optional) Email `/send_draft` previews go to; auto-created + tagged. Default `aleksgornikmedia@gmail.com` |
+| `KIT_PREVIEW_EMAIL` | (optional) Email `/send_draft` previews go to; auto-created + tagged. Default `aleksandergornik@gmail.com` (active subscriber) |
 | `PUBLIC_BASE_URL` | (optional) This service's public URL, used to build absolute `<img>` URLs. Defaults to the Railway domain |
 | `YOUTUBE_URL` | (optional) Channel link for the auto-appended sign-off. Default `https://www.youtube.com/@aleksgornik` |
 

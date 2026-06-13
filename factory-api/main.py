@@ -118,7 +118,7 @@ PREVIEW_TAG_MAX_SUBSCRIBERS = 3
 # The email /send_draft sends previews to. The bot auto-creates this subscriber
 # and the preview tag if they don't exist. Must be an ACTIVE subscriber for Kit
 # to actually deliver (unsubscribed/cancelled addresses won't receive broadcasts).
-KIT_PREVIEW_EMAIL = os.environ.get("KIT_PREVIEW_EMAIL", "aleksgornikmedia@gmail.com")
+KIT_PREVIEW_EMAIL = os.environ.get("KIT_PREVIEW_EMAIL", "aleksandergornik@gmail.com")
 
 
 def get_groq() -> Groq:
