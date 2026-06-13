@@ -86,4 +86,16 @@ Uses v4: `POST https://api.kit.com/v4/broadcasts` with `X-Kit-Api-Key` header. *
 
 **Gotchas**: Starlette `StaticFiles` 404s route through the app's JSON exception handler, so a missing `/uploads/x` returns `application/json` `{"detail":"Not Found"}` — you CANNOT distinguish a live StaticFiles mount from an unmounted route via content-type (a deploy-detection probe failed because of this; use `railway logs` instead). Adding an image then sending TEXT feedback regenerates the draft and WIPES inserted images — add photos last. Sessions are in-memory (cleared on redeploy).
 
+## Session 2026-06-13
+
+**Status**: All features from prior session shipped and stable. Several bugs fixed, footer redesigned.
+
+**Work**: (1) **Railway volume created** — `newsletter-api-volume` mounted at `/data`; images now persist across redeploys. `_pick_upload_dir` now checks `/proc/mounts` to log honestly whether a real volume is attached. (2) **JSON control character fix** — Llama sometimes embeds literal control chars (including `\x0a` newline) inside JSON string values; `parse_draft()` now strips the full `[\x00-\x1f\x7f]` range before `json.loads()`. Earlier fix only stripped `[\x00-\x08\x0b\x0c\x0e-\x1f]`, missing newlines inside strings. (3) **Footer redesigned** — replaced the 1924×556 banner (`channel.png`) with an exact replica of the Kit "pic + Channel" snippet: 181px circular headshot from Kit's own CDN (`embed.filekitcdn.com/e/ryjdbMCD8h44uP8HMNqBwC/4QqXGRzzAXGnbj3Uf5mUSx/email`), same 18px font, same colors as the Kit editor. Footer order is now: P.S. coaching block first, then circular pic + channel link at the bottom. (4) **User images sized down** — capped at `320px` wide (was full-width). (5) **Image captions** — Telegram photo caption now appears below the inserted image in the email as small grey text (14px, `#666`). (6) **Smart-quote SyntaxError** — edit tooling introduced curly apostrophes (`'` U+2019) as Python string delimiters, crashing the app on deploy. Fixed with a bulk byte-level replacement; `python3 -c "compile(...)"` is now used to gate every deploy.
+
+**Key decisions**: Kit snippet HTML was reverse-engineered from the Kit editor DOM (saved as `static/snippet.html`). Profile image URL from Kit CDN is hardcoded as `KIT_PROFILE_IMG` — it's Aleks's Kit account headshot, not the local `channel.png`.
+
+**Remaining**: `channel.png` is now unused in the footer (superseded by Kit CDN image) but still served at `/static/channel.png` — can be deleted or repurposed. No other known blockers.
+
+**Gotchas**: Always run `python3 -c "compile(open('main.py').read(), 'main.py', 'exec')"` before `railway up` — the Edit tool has injected curly quotes as string delimiters twice now. The Kit CDN image URL (`KIT_PROFILE_IMG`) is tied to Aleks's Kit account; if the account/image changes it'll silently break. `static/snippet.html` and `static/broadcast.html` are large dev artefacts (635KB each) — they should not be deployed but currently are (no `.railwayignore`).
+
 
