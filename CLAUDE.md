@@ -6,7 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Telegram bot that converts voice notes into publish-ready newsletter drafts in Aleks Gornik's writing style. The bot is deployed on Railway.
 
-**Flow:** User sends voice message to Telegram bot → Groq Whisper transcribes audio → Llama 3.3 70B generates newsletter draft using the style guide → bot replies with draft + 3 subject lines → `/push` creates a Kit.com broadcast draft.
+**Flow:** User sends voice message to Telegram bot → Gemini transcribes audio → Gemini generates newsletter draft using the style guide → bot replies with draft + 3 subject lines → `/push` creates a Kit.com broadcast draft.
+
+**LLM provider:** Gemini (`gemini-2.5-flash` by default) is primary for transcription, generation, the editor pass, and image placement — it handles text better. Groq (Llama 3.3 70B / Whisper large-v3) is the automatic fallback if `GEMINI_API_KEY` is unset or any Gemini call fails (incl. transient 429/5xx, which `_gemini_request` retries 3× before giving up). All routing goes through `llm_complete()` and `transcribe_audio()`.
 
 ## Deployment
 
@@ -62,11 +64,13 @@ The generation prompt enforces that all concrete details (names, numbers, storie
 
 | Variable | Purpose |
 |---|---|
-| `GROQ_API_KEY` | Transcription (Whisper) + generation (Llama) |
+| `GEMINI_API_KEY` | PRIMARY: transcription + generation + editor + image placement (Gemini) |
+| `GEMINI_MODEL` | (optional) Gemini model id. Default `gemini-2.5-flash` |
+| `GROQ_API_KEY` | FALLBACK: transcription (Whisper) + generation (Llama) when Gemini is unset/fails |
 | `TELEGRAM_BOT_TOKEN` | Bot: `@newsletter_copywriter_bot` |
 | `KIT_API_KEY` | Kit.com API v4 for `/push` and `/send_draft` |
-| `GEMINI_API_KEY` | Not currently used (was original LLM, switched to Groq) |
 | `KIT_PREVIEW_TAG` | (optional) Kit tag name `/send_draft` sends previews to. Default `Preview` |
+| `KIT_PREVIEW_EMAIL` | (optional) Email `/send_draft` previews go to; auto-created + tagged. Default `aleksgornikmedia@gmail.com` |
 | `PUBLIC_BASE_URL` | (optional) This service's public URL, used to build absolute `<img>` URLs. Defaults to the Railway domain |
 | `YOUTUBE_URL` | (optional) Channel link for the auto-appended sign-off. Default `https://www.youtube.com/@aleksgornik` |
 

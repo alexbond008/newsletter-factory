@@ -1,8 +1,10 @@
+import base64
 import json
 import logging
 import os
 import re
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +33,14 @@ STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+def _is_volume_mounted(path: Path) -> bool:
+    try:
+        mounts = Path("/proc/mounts").read_text()
+        return any(str(path) in line for line in mounts.splitlines())
+    except Exception:
+        return False
+
+
 def _pick_upload_dir() -> Path:
     """Where user-uploaded images live. Prefer the persistent Railway volume at
     /data (survives restarts/redeploys); fall back to a local dir (ephemeral —
@@ -43,7 +53,11 @@ def _pick_upload_dir() -> Path:
             probe = d / ".write_test"
             probe.write_text("ok")
             probe.unlink()
-            logger.info(f"upload dir = {d} ({'persistent volume' if str(d).startswith('/data') else 'EPHEMERAL local'})")
+            if str(d).startswith("/data"):
+                label = "persistent volume" if _is_volume_mounted(Path("/data")) else "EPHEMERAL /data (no volume mounted)"
+            else:
+                label = "EPHEMERAL local"
+            logger.info(f"upload dir = {d} ({label})")
             return d
         except Exception:
             continue
@@ -101,12 +115,90 @@ _sessions: dict[int, dict] = {}
 # than this, so a misconfigured tag can never blast the whole list.
 PREVIEW_TAG_MAX_SUBSCRIBERS = 3
 
+# The email /send_draft sends previews to. The bot auto-creates this subscriber
+# and the preview tag if they don't exist. Must be an ACTIVE subscriber for Kit
+# to actually deliver (unsubscribed/cancelled addresses won't receive broadcasts).
+KIT_PREVIEW_EMAIL = os.environ.get("KIT_PREVIEW_EMAIL", "aleksgornikmedia@gmail.com")
+
 
 def get_groq() -> Groq:
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
         raise RuntimeError("GROQ_API_KEY not set")
     return Groq(api_key=api_key)
+
+
+# ── LLM provider: Gemini primary, Groq (Llama / Whisper) fallback ──────────────
+# Gemini handles text better, so it's the default for generation, editing and
+# transcription. If GEMINI_API_KEY is unset or any Gemini call fails, we fall
+# back to Groq automatically so the bot keeps working.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+GROQ_TEXT_MODEL = "llama-3.3-70b-versatile"
+
+
+def _gemini_request(parts: list, system: str | None, temperature: float, max_tokens: int) -> str:
+    """Single-turn call to Gemini generateContent. Returns the concatenated text
+    of the first candidate. Raises on HTTP error or no candidate so the caller
+    can fall back to Groq."""
+    body = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+            # Disable "thinking" — these are direct generation/transcription tasks,
+            # and on 2.5 flash an unbounded thinking budget can silently consume
+            # the whole output allowance and return an empty candidate.
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+    if system:
+        body["systemInstruction"] = {"parts": [{"text": system}]}
+    # Gemini intermittently returns transient 429/500/503s under load. Retry a few
+    # times with backoff before letting the caller fall back to Groq, so we keep
+    # generations on Gemini (better text quality) whenever possible.
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        r = httpx.post(
+            f"{GEMINI_URL}/{GEMINI_MODEL}:generateContent",
+            params={"key": GEMINI_API_KEY},
+            json=body,
+            timeout=120,
+        )
+        if r.status_code in (429, 500, 502, 503, 504):
+            last_exc = httpx.HTTPStatusError(
+                f"Gemini transient {r.status_code}", request=r.request, response=r
+            )
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        r.raise_for_status()
+        cand = r.json()["candidates"][0]
+        return "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", [])).strip()
+    raise last_exc  # exhausted retries on transient errors
+
+
+def llm_complete(system: str, user: str, temperature: float = 0.7, max_tokens: int = 4096) -> str:
+    """Text completion. Prefer Gemini; fall back to Groq Llama on any failure."""
+    if GEMINI_API_KEY:
+        try:
+            out = _gemini_request([{"text": user}], system, temperature, max_tokens)
+            if out:
+                return out
+            logger.warning("Gemini returned empty text; falling back to Groq")
+        except Exception:
+            logger.exception("Gemini text generation failed; falling back to Groq")
+    client = get_groq()
+    resp = client.chat.completions.create(
+        model=GROQ_TEXT_MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 
 def parse_draft(raw: str) -> dict:
@@ -116,10 +208,36 @@ def parse_draft(raw: str) -> dict:
         if raw.startswith("json"):
             raw = raw[4:]
         raw = raw.strip()
+    # Strip ALL control characters the LLM sometimes embeds inside JSON string
+    # values (including literal \n, \r, \t which are valid JSON whitespace at
+    # the structural level but illegal inside strings). Replacing with space is
+    # safe — JSON is whitespace-insensitive between tokens.
+    raw = re.sub(r'[\x00-\x1f\x7f]', ' ', raw)
     return json.loads(raw)
 
 
-def transcribe_audio(audio_bytes: bytes) -> str:
+TRANSCRIBE_PROMPT = (
+    "Transcribe this voice note verbatim in English. Return ONLY the transcript "
+    "text — no preamble, no quotation marks, no commentary."
+)
+
+
+def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
+    """Transcribe a voice note. Prefer Gemini (handles ogg/opus inline); fall back
+    to Groq Whisper large-v3 on any failure."""
+    if GEMINI_API_KEY:
+        try:
+            b64 = base64.b64encode(audio_bytes).decode()
+            parts = [
+                {"text": TRANSCRIBE_PROMPT},
+                {"inline_data": {"mime_type": mime_type, "data": b64}},
+            ]
+            out = _gemini_request(parts, None, 0, 8192)
+            if out:
+                return out
+            logger.warning("Gemini transcription empty; falling back to Groq Whisper")
+        except Exception:
+            logger.exception("Gemini transcription failed; falling back to Groq Whisper")
     client = get_groq()
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
         f.write(audio_bytes)
@@ -149,17 +267,7 @@ Return the corrected body_html only — no JSON wrapper, no explanation, just th
 
 
 def editor_pass(draft: dict) -> dict:
-    client = get_groq()
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": EDITOR_PROMPT},
-            {"role": "user", "content": draft["body_html"]},
-        ],
-        temperature=0.2,
-        max_tokens=4096,
-    )
-    corrected_html = response.choices[0].message.content.strip()
+    corrected_html = llm_complete(EDITOR_PROMPT, draft["body_html"], temperature=0.2, max_tokens=8192)
     # Strip any accidental markdown fences
     if corrected_html.startswith("```"):
         corrected_html = corrected_html.split("```")[1]
@@ -177,17 +285,8 @@ def generate_from_transcript(transcript: str, feedback: str = "") -> dict:
         transcript=transcript,
         feedback_section=feedback_section,
     )
-    client = get_groq()
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.7,
-        max_tokens=4096,
-    )
-    draft = parse_draft(response.choices[0].message.content)
+    raw = llm_complete(SYSTEM_PROMPT, prompt, temperature=0.7, max_tokens=8192)
+    draft = parse_draft(raw)
     return editor_pass(draft)
 
 
@@ -204,10 +303,15 @@ Reply with ONLY a number — nothing else:
 
 def image_block(url: str, caption: str) -> str:
     alt = (caption or "image").replace('"', "'")
+    caption_html = (
+        f'<p style="text-align:center;font-size:14px;color:#666;margin-top:4px;">{caption}</p>'
+        if caption else ""
+    )
     return (
         f'<p style="text-align:center;">'
-        f'<img src="{url}" alt="{alt}" style="max-width:100%;height:auto;" />'
+        f'<img src="{url}" alt="{alt}" style="display:inline-block;max-width:55%;width:320px;height:auto;" />'
         f"</p>"
+        f"{caption_html}"
     )
 
 
@@ -219,17 +323,8 @@ def choose_image_position(paragraphs: list[str], caption: str) -> int:
     )
     user = f"Caption: {caption or '(no caption given)'}\n\nParagraphs:\n{numbered}"
     try:
-        client = get_groq()
-        resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": IMG_PLACE_PROMPT},
-                {"role": "user", "content": user},
-            ],
-            temperature=0,
-            max_tokens=8,
-        )
-        m = re.search(r"\d+", resp.choices[0].message.content or "")
+        out = llm_complete(IMG_PLACE_PROMPT, user, temperature=0, max_tokens=16)
+        m = re.search(r"\d+", out or "")
         n = int(m.group()) if m else len(paragraphs)
     except Exception:
         logger.exception("image position selection failed; appending at end")
@@ -251,28 +346,40 @@ def insert_image_into_draft(body_html: str, url: str, caption: str) -> str:
     return body_html[:idx] + block + body_html[idx:]
 
 
+def apply_images(body_html: str, images: list[dict]) -> str:
+    """Re-insert every image the user has added this session into a (freshly
+    regenerated) draft body, so feedback edits don't wipe previously added
+    images. Each image is {"url": ..., "caption": ...}."""
+    for img in images:
+        body_html = insert_image_into_draft(body_html, img["url"], img.get("caption", ""))
+    return body_html
+
+
 # Aleks always ends every newsletter with two Kit "reusable snippets":
-#   1. "pic + Channel" — his profile photo linking to his YouTube channel
-#   2. "P.S. Coaching" — a P.S. offering 1:1 coaching with a Calendly link
-# Kit snippets can't be referenced via the API, so we bake their exact content
-# in here as static HTML and auto-append it to every draft. The channel image is
-# served by this app from /static/channel.png.
+#   1. "P.S. Coaching" — a P.S. offering 1:1 coaching with a Calendly link
+#   2. "pic + Channel" — circular headshot from Kit CDN linking to YouTube
+# Replicated from the Kit snippet editor HTML (exact styles preserved).
 YOUTUBE_URL = os.environ.get("YOUTUBE_URL", "https://www.youtube.com/@aleksgornik")
 COACHING_CALENDLY_URL = "https://calendly.com/aleksgornikmedia/strategy-call-with-aleks"
+KIT_PROFILE_IMG = "https://embed.filekitcdn.com/e/ryjdbMCD8h44uP8HMNqBwC/4QqXGRzzAXGnbj3Uf5mUSx/email"
 
 
 def signature_footer() -> str:
+    coaching_link = f'<a href="{COACHING_CALENDLY_URL}">{COACHING_CALENDLY_URL}</a>'
+    channel_link = f'<a href="{YOUTUBE_URL}" style="color:rgb(0,0,255);">@aleksgornik</a>'
     return (
-        f'<p style="text-align:center;">'
-        f'<a href="{YOUTUBE_URL}">'
-        f'<img src="{PUBLIC_BASE_URL}/static/channel.png" alt="My YouTube channel: @aleksgornik" '
-        f'style="max-width:100%;width:520px;height:auto;" />'
-        f"</a></p>"
-        f"<p>P.S.</p>"
-        f"<p>I'm planning to run 1-on-1 coaching with a select few students to help you "
-        f"navigate university and land those internship / grad roles.</p>"
-        f'<p>If you’re interested, book a call with me here at '
-        f'<a href="{COACHING_CALENDLY_URL}">{COACHING_CALENDLY_URL}</a>.</p>'
+        "<p>P.S.</p>"
+        "<p>I'm planning to run 1-on-1 coaching with a select few students to help you "
+        "navigate university and land those internship / grad roles.</p>"
+        f"<p>If you're interested, book a call with me here at {coaching_link}.</p>"
+        f'<p style="text-align:center;margin:20px 0 4px;">'
+        f'<a href="{YOUTUBE_URL}" style="text-decoration:none;">'
+        f'<img src="{KIT_PROFILE_IMG}" width="181" height="181"'
+        f' style="border-radius:9999px;width:181px;height:auto;display:inline-block;object-fit:contain;"'
+        f' alt="Aleks Gornik" /></a></p>'
+        f'<p style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:18px;'
+        f'color:rgb(53,53,53);font-weight:400;line-height:1.5;text-align:center;margin:4px 0 20px;">'
+        f"My youtube channel : {channel_link}</p>"
     )
 
 
@@ -323,6 +430,59 @@ def find_kit_tag(kit_key: str, name: str) -> dict | None:
         if tag.get("name", "").strip().lower() == name.strip().lower():
             return tag
     return None
+
+
+def find_or_create_kit_tag(kit_key: str, name: str) -> dict | None:
+    """Return the Kit tag with this name, creating it if it doesn't exist."""
+    tag = find_kit_tag(kit_key, name)
+    if tag:
+        return tag
+    r = httpx.post(
+        "https://api.kit.com/v4/tags",
+        headers={"X-Kit-Api-Key": kit_key, "Content-Type": "application/json"},
+        json={"name": name},
+        timeout=30,
+    )
+    logger.info(f"kit create tag status={r.status_code} body={r.text[:200]}")
+    if r.status_code in (200, 201):
+        return r.json().get("tag")
+    return None
+
+
+def find_or_create_kit_subscriber(kit_key: str, email: str) -> dict | None:
+    """Return the Kit subscriber for this email, creating it if needed. The returned
+    dict includes "state" — broadcasts only deliver to an "active" subscriber."""
+    r = httpx.get(
+        "https://api.kit.com/v4/subscribers",
+        headers={"X-Kit-Api-Key": kit_key},
+        params={"email_address": email},
+        timeout=30,
+    )
+    if r.status_code == 200:
+        subs = r.json().get("subscribers", [])
+        if subs:
+            return subs[0]
+    r = httpx.post(
+        "https://api.kit.com/v4/subscribers",
+        headers={"X-Kit-Api-Key": kit_key, "Content-Type": "application/json"},
+        json={"email_address": email},
+        timeout=30,
+    )
+    logger.info(f"kit create subscriber status={r.status_code} body={r.text[:200]}")
+    if r.status_code in (200, 201):
+        return r.json().get("subscriber")
+    return None
+
+
+def tag_kit_subscriber(kit_key: str, tag_id: int, subscriber_id: int) -> bool:
+    """Add a subscriber to a tag. Idempotent on Kit's side."""
+    r = httpx.post(
+        f"https://api.kit.com/v4/tags/{tag_id}/subscribers/{subscriber_id}",
+        headers={"X-Kit-Api-Key": kit_key, "Content-Type": "application/json"},
+        timeout=30,
+    )
+    logger.info(f"kit tag subscriber status={r.status_code}")
+    return r.status_code in (200, 201)
 
 
 def send_kit_preview(kit_key: str, draft: dict, tag_id: int) -> int | None:
@@ -452,15 +612,16 @@ async def handle_telegram_update(update: dict) -> None:
             tg_send(chat_id, "KIT_API_KEY not configured.")
             return
         tag_name = os.environ.get("KIT_PREVIEW_TAG", "Preview")
-        tag = find_kit_tag(kit_key, tag_name)
+        # Auto-provision: find-or-create the preview tag, ensure the preview email
+        # exists as a subscriber and is tagged. This is what makes /send_draft work
+        # out of the box instead of failing on a missing tag.
+        tag = find_or_create_kit_tag(kit_key, tag_name)
         if not tag:
-            tg_send(chat_id, (
-                f"No Kit tag named \"{tag_name}\" found.\n\n"
-                f"In Kit, create a tag called \"{tag_name}\" and add only your own email to it, "
-                f"then try /send_draft again. (Or set KIT_PREVIEW_TAG to an existing tag name.)"
-            ))
+            tg_send(chat_id, f"Couldn't create or find the \"{tag_name}\" tag in Kit. Check the logs.")
             return
-        count = tag.get("subscriber_count", 0)
+        # Safety stop only when the tag ALREADY has many subscribers (a misconfigured
+        # tag pointing at the whole list). A freshly created tag reports no count.
+        count = tag.get("subscriber_count") or 0
         if count > PREVIEW_TAG_MAX_SUBSCRIBERS:
             tg_send(chat_id, (
                 f"Safety stop: the \"{tag_name}\" tag has {count} subscribers. "
@@ -468,7 +629,22 @@ async def handle_telegram_update(update: dict) -> None:
                 f"or fewer before using /send_draft, so this never blasts your whole list."
             ))
             return
-        tg_send(chat_id, f"Sending a preview to the \"{tag_name}\" tag ({count} subscriber(s))... check your inbox shortly.")
+        subscriber = find_or_create_kit_subscriber(kit_key, KIT_PREVIEW_EMAIL)
+        if not subscriber:
+            tg_send(chat_id, f"Couldn't set up the preview subscriber ({KIT_PREVIEW_EMAIL}) in Kit. Check the logs.")
+            return
+        tag_kit_subscriber(kit_key, tag["id"], subscriber["id"])
+        # Kit only delivers broadcasts to ACTIVE subscribers. If the preview email is
+        # unsubscribed/cancelled, the send "succeeds" but never lands — warn instead.
+        state = (subscriber.get("state") or "").lower()
+        if state and state != "active":
+            tg_send(chat_id, (
+                f"Your preview email ({KIT_PREVIEW_EMAIL}) is \"{state}\" in Kit, so Kit won't "
+                f"deliver previews to it. Reactivate it in Kit (Subscribers → set to active / resubscribe), "
+                f"or set KIT_PREVIEW_EMAIL to an active address, then try /send_draft again."
+            ))
+            return
+        tg_send(chat_id, f"Sending a preview to {KIT_PREVIEW_EMAIL}... check your inbox shortly.")
         broadcast_id = send_kit_preview(kit_key, draft, tag["id"])
         if broadcast_id:
             tg_send(chat_id, "Preview scheduled to send now. It should land in your inbox within a minute or two.")
@@ -493,6 +669,9 @@ async def handle_telegram_update(update: dict) -> None:
             logger.info(f"saved image {fname} ({len(img_bytes)} bytes) caption={caption!r}")
             draft = session["draft"]
             draft["body_html"] = insert_image_into_draft(draft["body_html"], public_url, caption)
+            # Remember the image so a later text-feedback regeneration re-applies it
+            # instead of wiping it.
+            session.setdefault("images", []).append({"url": public_url, "caption": caption})
             _sessions[chat_id]["draft"] = draft
             tg_send(chat_id, format_draft_message(draft))
         except Exception as e:
@@ -505,8 +684,9 @@ async def handle_telegram_update(update: dict) -> None:
         try:
             file_url = tg_get_file_url(voice["file_id"])
             audio_bytes = httpx.get(file_url, timeout=60).content
-            logger.info(f"Downloaded audio: {len(audio_bytes)} bytes")
-            transcript = transcribe_audio(audio_bytes)
+            mime_type = voice.get("mime_type", "audio/ogg")
+            logger.info(f"Downloaded audio: {len(audio_bytes)} bytes ({mime_type})")
+            transcript = transcribe_audio(audio_bytes, mime_type)
             logger.info(f"Transcript: {transcript[:200]}")
             draft = generate_from_transcript(transcript)
             _sessions[chat_id] = {"draft": draft, "transcript": transcript}
@@ -524,6 +704,8 @@ async def handle_telegram_update(update: dict) -> None:
         tg_send(chat_id, "Regenerating with your feedback...")
         try:
             draft = generate_from_transcript(session["transcript"], feedback=text)
+            # Re-apply any images added this session so feedback doesn't wipe them.
+            draft["body_html"] = apply_images(draft["body_html"], session.get("images", []))
             _sessions[chat_id]["draft"] = draft
             tg_send(chat_id, format_draft_message(draft))
         except Exception as e:
